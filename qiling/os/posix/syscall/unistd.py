@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import itertools
 import pathlib
@@ -839,6 +840,11 @@ def __do_unlink(ql: Qiling, absvpath: str) -> int:
 
         try:
             os.unlink(hpath)
+        except FileNotFoundError:
+            # unlink reports ENOENT when the file or a path-prefix component is missing.
+            # Generic -1 would incorrectly report EPERM to the guest.
+            # See https://man7.org/linux/man-pages/man2/unlink.2.html
+            return -ENOENT
         except OSError:
             return -1
 
@@ -863,6 +869,84 @@ def ql_syscall_unlinkat(ql: Qiling, dirfd: int, pathname: int, flags: int):
     regreturn = absvpath if isinstance(absvpath, int) else __do_unlink(ql, absvpath)
 
     ql.log.debug(f'unlinkat({dirfd}, "{vpath}") = {regreturn}')
+
+    return regreturn
+
+
+def __symlink_error(ql: Qiling, error: OSError) -> int:
+    """Translate host filesystem errors to the guest ABI by their names."""
+    name = errno.errorcode.get(error.errno, 'EIO')
+    guest_errors = {name: number for number, name in errors.items()}
+    guest_errors['ENOTSUP'] = EOPNOTSUPP
+
+    # These filesystem errors differ from the generic Linux ABI.
+    # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/errno.h
+    if ql.os.type in (QL_OS.MACOS, QL_OS.FREEBSD):
+        guest_errors.update(EAGAIN=35, ELOOP=62, ENAMETOOLONG=63, ENOTEMPTY=66,
+                            EDQUOT=69, ENOSYS=78, ENOTSUP=45,
+                            EOPNOTSUPP=102 if ql.os.type == QL_OS.MACOS else 45)
+    # https://github.com/torvalds/linux/blob/master/arch/mips/include/uapi/asm/errno.h
+    elif ql.os.type == QL_OS.LINUX and ql.arch.type == QL_ARCH.MIPS:
+        guest_errors.update(ENAMETOOLONG=78, ENOSYS=89, ELOOP=90,
+                            ENOTEMPTY=93, EDQUOT=1133, ENOTSUP=122, EOPNOTSUPP=122)
+
+    return -guest_errors.get(name, EIO)
+
+
+def __do_symlink(ql: Qiling, vtarget: str, absvpath: str) -> int:
+    if not vtarget:
+        return -ENOENT
+
+    # Preserve target text, including guest-absolute and dangling targets. Resolve
+    # only the parent of linkpath so an existing link still produces EEXIST.
+    # See https://man7.org/linux/man-pages/man2/symlink.2.html
+    try:
+        if absvpath.endswith('/') or absvpath.rsplit('/', 1)[-1] in ('.', '..'):
+            hnew = ql.os.path.virtual_to_host_path(absvpath) + os.sep
+        else:
+            vpath = ql.os.path.PureVirtualPath(absvpath)
+            hparent = ql.os.path.virtual_to_host_path(str(vpath.parent))
+            hnew = os.path.join(hparent, vpath.name)
+
+        if not ql.os.path.is_safe_host_path(os.path.dirname(hnew)):
+            return -EACCES
+
+        os.symlink(vtarget, hnew)
+    except OSError as ex:
+        return __symlink_error(ql, ex)
+
+    return 0
+
+
+def ql_syscall_symlink(ql: Qiling, target: int, newpath: int):
+    vtarget = ql.os.utils.read_cstring(target)
+    vnewpath = ql.os.utils.read_cstring(newpath)
+    # Keep trailing separators and dot components for the host's error checks.
+    absvpath = vnewpath if ql.os.path.is_virtual_abspath(vnewpath) else f'{ql.os.path.cwd}/{vnewpath}'
+    regreturn = __do_symlink(ql, vtarget, absvpath) if vnewpath else -ENOENT
+
+    ql.log.debug(f'symlink("{vtarget}", "{vnewpath}") = {regreturn}')
+
+    return regreturn
+
+
+def ql_syscall_symlinkat(ql: Qiling, target: int, newdirfd: int, newpath: int):
+    vtarget = ql.os.utils.read_cstring(target)
+    vnewpath = ql.os.utils.read_cstring(newpath)
+    absvpath = virtual_abspath_at(ql, vnewpath, newdirfd)
+
+    if not vnewpath:
+        regreturn = -ENOENT
+    elif isinstance(absvpath, int):
+        regreturn = absvpath
+    else:
+        # virtual_abspath_at normalizes trailing separators and dots; preserve
+        # their directory semantics rather than creating a regular link there.
+        if vnewpath.endswith('/') or vnewpath.rsplit('/', 1)[-1] == '.':
+            absvpath += '/'
+        regreturn = __do_symlink(ql, vtarget, absvpath)
+
+    ql.log.debug(f'symlinkat("{vtarget}", {newdirfd}, "{vnewpath}") = {regreturn}')
 
     return regreturn
 

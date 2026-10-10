@@ -146,7 +146,10 @@ def __sigprocmask(ql: Qiling, how: int, newset: int, oldset: int):
     SIGSTOP = 19
 
     if oldset:
-        ql.mem.write_ptr(newset, ql.os.blocked_signals)
+        # Return the existing signal mask before applying changes below.
+        # newset is an input buffer address, not the previous mask value.
+        # See https://man7.org/linux/man-pages/man2/sigprocmask.2.html
+        ql.mem.write_ptr(oldset, ql.os.blocked_signals)
 
     if newset:
         set_mask = ql.mem.read_ptr(newset)

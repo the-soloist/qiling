@@ -128,12 +128,14 @@ class QlOsPath:
         vpath = None
 
         if fullpath.is_symlink():
-            resolved = fullpath.resolve(strict=False)
+            # Interpret link text in the guest filesystem instead of the host root.
+            resolved = Path(os.readlink(fullpath))
+            if not resolved.is_absolute():
+                return self.PureVirtualPath(str(resolved))
 
             try:
-                # the resolve method turns fullpath into an absolute path on the host,
-                # but we need it to be an absolute virtual path. to convert the host
-                # path to virtual we have to make sure it resides within rootfs.
+                # Legacy rootfs links may contain absolute host paths. Convert
+                # those back to virtual paths when they reside within rootfs.
                 #
                 # if the host path is indeed under rootfs, we can rebase the virtual
                 # portion on top of rootfs and return an absolute virtual path.
@@ -216,7 +218,7 @@ class QlOsPath:
                     # recursively resolve the new virtual path we got
                     vres = self.__virtual_resolve(new_vpath)
 
-                    acc_hpath = Path(vres)
+                    acc_hpath = Path(*vres.relative_to(vres.anchor).parts)
                     acc_vpath = vres
 
         return acc_vpath
